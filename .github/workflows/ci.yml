@@ -1,0 +1,71 @@
+name: ci
+
+# Cheap checks on every pull request and push: the resources compose against the pinned
+# compiler, the build context renders, the harness's own tests pass, and every artifact URL the
+# plan declares is resolved and hashed. No image, no KVM, no registry.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compose and render with the pinned compiler
+        run: |
+          make fetch
+          . ./deskos.env
+          tool=".deskos/$DESKOS_VERSION/deskosctl-$DESKOS_VERSION-linux-amd64"
+          "$tool" validate .
+          for ws in $(grep -h '^  name:' workstations/*.yaml | awk '{print $2}'); do
+            "$tool" plan . --workstation "$ws" > /dev/null
+          done
+          "$tool" render . --workstation deskos-ubuntu --output dist/render
+
+      - name: The harness's own tests
+        run: make vm-test
+
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - id: pin
+        run: |
+          . ./deskos.env
+          echo "version=$DESKOS_VERSION" >> "$GITHUB_OUTPUT"
+
+      # The script comes from deskos-core, which owns the model it checks, at the same release
+      # this repository compiles with. What it proves is what a plan can prove: a declared URL
+      # resolves, hashes to its declared sha256, and serves repodata if it is a repository. A
+      # version bumped without its asset name or checksum reaches an image build otherwise --
+      # it happened downstream, and this is the check that catches it.
+      - uses: actions/checkout@v7
+        with:
+          repository: deskosproject/deskos-core
+          ref: ${{ steps.pin.outputs.version }}
+          path: .deskos-core/pin
+
+      - name: Render, then resolve every artifact the plan declares
+        run: |
+          make fetch
+          . ./deskos.env
+          tool=".deskos/$DESKOS_VERSION/deskosctl-$DESKOS_VERSION-linux-amd64"
+          "$tool" render . --workstation deskos-ubuntu --output ctx
+          python3 .deskos-core/pin/tests/artifacts/resolve.py ctx/plan.json --summary resolve.md
+
+      - name: Keep the summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resolve
+          path: resolve.md
+          retention-days: 14

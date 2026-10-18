@@ -1,0 +1,79 @@
+name: core main
+
+# The early warning ADR 0020 asks for: this repository composes, renders and builds against
+# deskos-core's `main`, not against the release it pins, and opens an issue in deskos-core when
+# that breaks.
+#
+# It is not a substitute for the gate on the pinned release -- nothing here boots a machine, and
+# the publish gate is what makes a claim about an image -- but it is what turns "Core changed
+# something that breaks Ubuntu" into an issue in the repository that changed it, instead of a
+# surprise on the next bump.
+on:
+  schedule:
+    # Monday 05:00 UTC, before the weekly watch in publish.yml.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WORK: /mnt/deskos-work
+
+jobs:
+  against-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out this repository, and deskos-core at main
+        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: deskosproject/deskos-core
+          ref: main
+          path: .deskos-core/main
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .deskos-core/main/go.mod
+
+      - name: Compose and render with deskos-core's main
+        id: compose
+        run: |
+          go build -C .deskos-core/main -o "$PWD/bin/deskosctl-main" ./cmd/deskosctl
+          ./bin/deskosctl-main validate .
+          for ws in $(grep -h '^  name:' workstations/*.yaml | awk '{print $2}'); do
+            ./bin/deskosctl-main render . --workstation "$ws" --output "ctx-$ws"
+          done
+          sha256sum ctx-*/plan.json
+
+      - name: Build the image that main renders
+        id: build
+        run: |
+          sudo mkdir -p "$WORK" /var/lib/containers /etc/containers
+          base=$(grep -m1 '^FROM ' ctx-deskos-ubuntu/Containerfile | awk '{print $2}')
+          ok=0
+          for i in 1 2 3 4 5; do
+            if sudo podman pull "$base"; then ok=1; break; fi
+            sleep 20
+          done
+          [ "$ok" = 1 ] || { echo "could not pull $base after 5 attempts" >&2; exit 1; }
+          sudo podman build --pull=never -t localhost/deskos-ubuntu:core-main ctx-deskos-ubuntu
+
+      - name: Open an issue in deskos-core when it breaks
+        if: failure()
+        env:
+          # A token with `issues: write` on deskos-core. Without it this step cannot warn, so it
+          # says so instead of failing silently.
+          GH_TOKEN: ${{ secrets.CORE_ISSUES_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::CORE_ISSUES_TOKEN is not set, so deskos-core cannot be told that main broke this platform. The failure is in this run's log and nobody there will see it."
+            exit 1
+          fi
+          gh issue create --repo deskosproject/deskos-core \
+            --title "deskos-ubuntu against main: $(date -u +%Y-%m-%d)" \
+            --body "The scheduled check in [deskosproject/deskos-ubuntu](https://github.com/deskosproject/deskos-ubuntu) composes, renders and builds this platform against \`main\` and it failed: [$RUN_URL]($RUN_URL).
+
+          This is the early warning ADR 0020 asks for, and it is not a claim about any release: nothing here boots a machine. What it means is that something in Core changed in a way this platform's resources or build context do not survive, and the next bump would carry it."

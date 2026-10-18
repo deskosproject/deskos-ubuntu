@@ -1,0 +1,206 @@
+name: vm-bootcheck
+
+# Builds this platform's image, writes a disk the way this platform has to be written, and asks
+# the guest what it did.
+#
+# There is no Anaconda path on Ubuntu, so the disk comes from `bootc install to-disk` out of a
+# compressed OCI layout — the recipe the base documents and the only install path this
+# repository can claim. The disk carries Canonical's boot experience, not DeskOS's, so the boot
+# check runs without --expect-splash. Three questions are asked of it, in three boots: does it
+# boot and shut down (bootcheck), does a GNOME session come up with the defaults the plan
+# declares (sessioncheck), and does the shipped wizard come up and can an account log in
+# (firstbootcheck). The last one matters most on a platform whose base ships no account and
+# whose desktop is its vendor's own.
+#
+# Both workstations are checked: the one a person takes, and the one that adds an
+# organization's signed package source, which is what proves the source and its key against the
+# vendor's own archive — `apt-get update` fails if the deb822 fields are wrong or the signature
+# is not verified.
+#
+# This is the check that replaces what deskos-core ran for this platform before ADR 0020. The
+# harness is vendored from the same release the compiler is pinned to, so the two move together.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "platforms/**"
+      - "workstations/**"
+      - "profiles/**"
+      - "software/**"
+      - "assets/**"
+      - "tests/vm/**"
+      - "deskos.env"
+      - "deskos.sha256"
+      - "Makefile"
+      - ".github/workflows/vm-bootcheck.yml"
+  push:
+    branches: [main]
+    paths:
+      - "platforms/**"
+      - "workstations/**"
+      - "profiles/**"
+      - "software/**"
+      - "assets/**"
+      - "tests/vm/**"
+      - "deskos.env"
+      - "deskos.sha256"
+      - "Makefile"
+      - ".github/workflows/vm-bootcheck.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-bootcheck-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  WORK: /mnt/deskos-work
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      # The two are independent checks: one failing should not hide the other.
+      fail-fast: false
+      matrix:
+        workstation: [deskos-ubuntu, deskos-ubuntu-org-packages]
+    env:
+      WS: ${{ matrix.workstation }}
+      IMAGE: localhost/deskos-ubuntu:${{ matrix.workstation }}
+      OCI: /mnt/deskos-work/oci-${{ matrix.workstation }}
+      DISK: /mnt/deskos-work/disk-${{ matrix.workstation }}.raw
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Render the build context with the pinned compiler
+        run: |
+          make fetch
+          . ./deskos.env
+          tool=".deskos/$DESKOS_VERSION/deskosctl-$DESKOS_VERSION-linux-amd64"
+          "$tool" validate .
+          "$tool" render . --workstation "$WS" --output ctx
+          sha256sum ctx/plan.json ctx/generated-manifest.json
+
+      - name: Put container storage and outputs on /mnt
+        run: |
+          df -h / /mnt
+          sudo mkdir -p /mnt/containers "$WORK" /var/lib/containers /etc/containers
+          sudo mount --bind /mnt/containers /var/lib/containers
+          printf '[storage]\ndriver = "overlay"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' | sudo tee /etc/containers/storage.conf
+          sudo chown "$(id -u):$(id -g)" "$WORK"
+          # The runner image ships a default CNI conflist while the CNI plugin binaries are
+          # not installed, and this podman uses netavark: nothing here creates a CNI network,
+          # and podman warns on every run about a file it does not read. Removing it keeps a
+          # warning in these logs worth reading.
+          sudo rm -f /etc/cni/net.d/87-podman-bridge.conflist
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install QEMU, OVMF and skopeo
+        run: |
+          # skopeo is not on the runner image, and this path needs it to write the compressed
+          # OCI layout the install reads.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf skopeo
+
+      - name: Pull the pinned base, with retries
+        run: |
+          # The base is the largest pull in this repository, and a registry that stumbles is
+          # not a defect: the retry is explicit and bounded, and the build below runs with
+          # --pull=never, so what it uses is what arrived and a failure there is a real one.
+          base=$(grep -m1 '^FROM ' ctx/Containerfile | awk '{print $2}')
+          ok=0
+          for i in 1 2 3 4 5; do
+            if sudo podman pull "$base"; then ok=1; break; fi
+            echo "attempt $i failed pulling $base; retrying in 20s" >&2
+            sleep 20
+          done
+          [ "$ok" = 1 ] || { echo "could not pull $base after 5 attempts" >&2; exit 1; }
+
+      - name: Build the image from the pinned base
+        timeout-minutes: 40
+        run: |
+          grep '^FROM ' ctx/Containerfile
+          sudo podman build --pull=never -t "$IMAGE" ctx
+
+      - name: Record image evidence
+        run: |
+          mkdir -p "$WORK/evidence-$WS"
+          cp ctx/plan.json ctx/generated-manifest.json "$WORK/evidence-$WS/"
+          grep '^FROM ' ctx/Containerfile > "$WORK/evidence-$WS/base.txt"
+          sudo podman image inspect "$IMAGE" --format 'id={{.Id}} digest={{.Digest}} created={{.Created}}' | tee "$WORK/evidence-$WS/image.txt"
+          sudo podman run --rm --network=none "$IMAGE" dpkg -l > "$WORK/evidence-$WS/dpkg-l.txt"
+          sudo podman run --rm --network=none "$IMAGE" sh -c 'command -v flatpak || echo "no flatpak"; ls /usr/share/flatpak 2>&1' \
+            | tee "$WORK/evidence-$WS/flatpak.txt"
+
+      - name: Write the disk from a compressed OCI layout
+        timeout-minutes: 30
+        run: |
+          # Layers must be compressed or the composefs import refuses them, and it is what the
+          # install mounts as its source; this is the recipe the base documents.
+          sudo skopeo copy containers-storage:"$IMAGE" "oci:$OCI:test"
+          truncate -s 32G "$DISK"
+          sudo podman run --rm --privileged --pid=host \
+            --security-opt label=type:unconfined_t \
+            -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
+            -v "$OCI:/src-oci:ro" -v "$(dirname "$DISK"):/output" \
+            "$IMAGE" bootc install to-disk --via-loopback "/output/$(basename "$DISK")" \
+            --source-imgref oci:/src-oci:test \
+            --composefs-backend --bootloader systemd --wipe --filesystem ext4 --allow-missing-verity
+
+      - name: Boot check (unmodified raw disk)
+        id: boot
+        timeout-minutes: 15
+        run: |
+          # No --expect-splash: this disk carries Canonical's boot experience, not DeskOS's.
+          python3 tests/vm/bootcheck.py --disk "$DISK" \
+            --out "$WORK/bootcheck-$WS" --hash-disk --boot-timeout 420 --shutdown-timeout 120
+
+      - name: Session check (instrumented boot)
+        id: session
+        timeout-minutes: 25
+        run: |
+          # The session check adds a user and an autologin, so on this platform it proves a
+          # GNOME session comes up, not the wizard: the first-boot check is what proves the
+          # shipped wizard. The plan declares no look, no favorites and no Firefox here, so
+          # what is checked is the session itself and its failed units.
+          python3 tests/vm/sessioncheck.py --mode session --disk "$DISK" \
+            --plan "$WORK/evidence-$WS/plan.json" --out "$WORK/session-$WS" \
+            --boot-timeout 900 --shutdown-timeout 120
+
+      - name: First-boot check (is the wizard the session, can an account log in)
+        id: firstboot
+        timeout-minutes: 25
+        run: |
+          python3 tests/vm/firstbootcheck.py --disk "$DISK" \
+            --out "$WORK/firstboot-$WS" --boot-timeout 900
+
+      - name: Summary
+        if: always()
+        run: |
+          for f in "$WORK/bootcheck-$WS/summary.md" "$WORK/session-$WS/session.md" \
+                   "$WORK/firstboot-$WS/firstboot.md"; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-evidence-${{ matrix.workstation }}
+          path: |
+            ${{ env.WORK }}/evidence-${{ env.WS }}
+            ${{ env.WORK }}/bootcheck-${{ env.WS }}
+            ${{ env.WORK }}/session-${{ env.WS }}
+            ${{ env.WORK }}/firstboot-${{ env.WS }}
+            !${{ env.WORK }}/**/*.qcow2
+            !${{ env.WORK }}/*.raw
+          retention-days: 14
+          if-no-files-found: warn
