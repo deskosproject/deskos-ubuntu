@@ -154,12 +154,19 @@ jobs:
           # The reviewed record is verified against the raw report and the gate configuration is
           # generated from it, so the gate can never accept more than the record approves: a new
           # component, a new version, a moved base layer or an expired review fails here first.
+          # Two calls, and not one: the checker writes the gate configuration and returns,
+          # so a single call with both flags would write the gate and never the record of
+          # what this scan actually accepted -- which is what the attestation carries.
           out=$(python3 .deskos-core/pin/tests/supply-chain/check_exceptions.py \
             --cves cves.json \
             --exceptions tests/supply-chain/exceptions.json \
             --plan ctx/plan.json \
-            --effective "$WORK/effective-exceptions.json" \
-            --emit-gate "$WORK/gate.grype.yaml")
+            --effective "$WORK/effective-exceptions.json")
+          echo "$out"
+          { echo "### Accepted vulnerability exceptions"; echo; echo "$out"; } >> "$GITHUB_STEP_SUMMARY"
+          python3 .deskos-core/pin/tests/supply-chain/check_exceptions.py \
+            --exceptions tests/supply-chain/exceptions.json \
+            --emit-gate "$WORK/gate.grype.yaml"
           # The gate applies the severity policy: the generated configuration and the OpenVEX
           # statements (ADR 0012, in deskos-core).
           grype "oci-archive:$WORK/image.tar" \
