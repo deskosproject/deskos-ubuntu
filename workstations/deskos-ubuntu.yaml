@@ -1,0 +1,19 @@
+apiVersion: core.deskos.org/v1alpha1
+kind: Workstation
+metadata:
+  name: deskos-ubuntu
+spec:
+  displayName: DeskOS on Ubuntu 26.04 LTS
+  platformRef: ubuntu-2604
+  # Core's foundation, and nothing else that is Core's: no `rhel-family` profile
+  # (an Ubuntu workstation must not carry firewalld, an RPM-named browser or an
+  # RPM application channel), and no `deskos-gnome` either, because this platform
+  # keeps the desktop its vendor ships and a default written here would reach
+  # nobody (ADR 0016).
+  #
+  # This is the workstation a person takes, and it is the one this repository
+  # builds, boots, runs a session on and takes to the first-boot wizard in CI.
+  # What an organization adds goes in a profile of its own: `org-packages` is
+  # the example, an organization's own signed package source.
+  profiles:
+    - deskos-core
