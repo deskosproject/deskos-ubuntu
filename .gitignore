@@ -1,0 +1,14 @@
+# The pinned tool is fetched, not committed: `make fetch` verifies it against
+# deskos.sha256, and a binary in the history would be a binary nobody verifies.
+.deskos/
+dist/
+output/
+
+# Python bytecode from the vendored harness.
+__pycache__/
+*.pyc
+
+# Disks written by an install, which are test input and never artifacts.
+*.qcow2
+*.raw
+*.iso
