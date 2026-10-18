@@ -1,0 +1,243 @@
+name: publish
+
+# The single publish path for this platform: builds the workstation from this checkout, writes
+# the declared SBOM with `deskosctl sbom`, produces the installed SBOM with Syft, scans it with
+# Grype against the accepted-exception record, compares the two for RPM and dpkg coverage,
+# writes a disk with `bootc install to-disk` and boots it, and only then tags, pushes, signs and
+# attests that one digest.
+#
+# Everything the claim rests on happens before the push: the image that is published is the
+# image that was scanned and booted, by digest, and `:latest` moves only after the signature
+# verifies. This repository signs with its own workflow identity, which is not
+# deskos-core's.
+#
+# Publishing is manual (`publish=true`), because a published image is what machines update
+# from. The weekly run is the watch: it builds and scans without publishing, so a base that
+# starts carrying something new is noticed on a schedule rather than by a user.
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the built, scanned and boot-checked image to quay.io and sign it
+        type: boolean
+        default: false
+      fail-on:
+        description: Grype severity that fails the job
+        type: choice
+        options: [negligible, low, medium, high, critical]
+        default: critical
+
+permissions:
+  contents: read
+  # Keyless cosign: this workflow's OIDC identity, which is the repository's name.
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  WORK: /mnt/deskos-work
+  WORKSTATION: deskos-ubuntu
+  IMAGE: localhost/deskos-ubuntu:ci
+  OCI: /mnt/deskos-work/oci
+  DISK: /mnt/deskos-work/disk.raw
+  DEST: quay.io/deskos/deskos-ubuntu
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out this repository, and deskos-core at the release it pins
+        uses: actions/checkout@v7
+        # The supply-chain scripts come from deskos-core, which owns the policy they enforce,
+        # and from the same release this repository compiles with: the scripts and the compiler
+        # move together or the check means nothing.
+      - id: pin
+        run: |
+          . ./deskos.env
+          echo "version=$DESKOS_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: deskosproject/deskos-core
+          ref: ${{ steps.pin.outputs.version }}
+          path: .deskos-core/pin
+
+      - name: Render the build context, and write the declared SBOM
+        run: |
+          make fetch
+          . ./deskos.env
+          tool=".deskos/$DESKOS_VERSION/deskosctl-$DESKOS_VERSION-linux-amd64"
+          "$tool" validate .
+          "$tool" render . --workstation "$WORKSTATION" --output ctx
+          "$tool" sbom --workstation "$WORKSTATION" --output declared.sbom.cdx.json
+          sha256sum ctx/plan.json ctx/generated-manifest.json declared.sbom.cdx.json
+
+      - name: Put container storage and the large artifacts on /mnt
+        run: |
+          df -h / /mnt
+          sudo mkdir -p /mnt/containers "$WORK" /var/lib/containers /etc/containers
+          sudo mount --bind /mnt/containers /var/lib/containers
+          printf '[storage]\ndriver = "overlay"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' | sudo tee /etc/containers/storage.conf
+          sudo chown "$(id -u):$(id -g)" "$WORK"
+          sudo rm -f /etc/cni/net.d/87-podman-bridge.conflist
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install QEMU, OVMF and skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf skopeo
+
+      - name: Pull the pinned base, with retries
+        run: |
+          base=$(grep -m1 '^FROM ' ctx/Containerfile | awk '{print $2}')
+          ok=0
+          for i in 1 2 3 4 5; do
+            if sudo podman pull "$base"; then ok=1; break; fi
+            echo "attempt $i failed pulling $base; retrying in 20s" >&2
+            sleep 20
+          done
+          [ "$ok" = 1 ] || { echo "could not pull $base after 5 attempts" >&2; exit 1; }
+
+      - name: Build the image
+        timeout-minutes: 40
+        run: |
+          sudo podman build --pull=never -t "$IMAGE" ctx
+          sudo podman image inspect "$IMAGE" --format 'id={{.Id}} created={{.Created}}'
+          sudo podman run --rm --network=none "$IMAGE" dpkg -l > "$WORK/dpkg-l.txt"
+
+      - name: Export the image to an OCI archive
+        run: |
+          sudo podman save --format oci-archive -o "$WORK/image.tar" "$IMAGE"
+          sudo chown "$(id -u):$(id -g)" "$WORK/image.tar"
+          ls -lh "$WORK/image.tar"
+
+      - name: Install cosign (pinned)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.3'
+
+      - name: Install Syft and Grype (pinned)
+        env:
+          # The installers are pinned by commit, and the versions they install by tag: an
+          # installer that moves is a scanner nobody chose.
+          SYFT_VERSION: v1.54.1
+          SYFT_INSTALL: b254e6d92f28c3868a755f62fb3ca8f26e9fee76
+          GRYPE_VERSION: v0.120.1
+          GRYPE_INSTALL: 6f8d854af29d3a3086b11a84afa51554a2a245fe
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/$SYFT_INSTALL/install.sh" | sh -s -- -b "$HOME/.local/bin" "$SYFT_VERSION"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/$GRYPE_INSTALL/install.sh" | sh -s -- -b "$HOME/.local/bin" "$GRYPE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Installed SBOM (Syft)
+        run: syft "oci-archive:$WORK/image.tar" -o cyclonedx-json=installed.sbom.cdx.json
+
+      - name: CVE scan (Grype)
+        run: |
+          grype "oci-archive:$WORK/image.tar" \
+            --config .deskos-core/pin/tests/supply-chain/grype-raw.yaml -o table | tee grype.txt
+          grype "oci-archive:$WORK/image.tar" \
+            --config .deskos-core/pin/tests/supply-chain/grype-raw.yaml -o json > cves.json
+          # The reviewed record is verified against the raw report and the gate configuration is
+          # generated from it, so the gate can never accept more than the record approves: a new
+          # component, a new version, a moved base layer or an expired review fails here first.
+          out=$(python3 .deskos-core/pin/tests/supply-chain/check_exceptions.py \
+            --cves cves.json \
+            --exceptions tests/supply-chain/exceptions.json \
+            --plan ctx/plan.json \
+            --effective "$WORK/effective-exceptions.json" \
+            --emit-gate "$WORK/gate.grype.yaml")
+          # The gate applies the severity policy: the generated configuration and the OpenVEX
+          # statements (ADR 0012, in deskos-core).
+          grype "oci-archive:$WORK/image.tar" \
+            --config "$WORK/gate.grype.yaml" \
+            --vex .deskos-core/pin/tests/supply-chain/vex.openvex.json \
+            --fail-on "${{ inputs.fail-on || 'critical' }}" -o table > /dev/null
+
+      - name: Compare declared and installed SBOMs
+        run: python3 .deskos-core/pin/tests/supply-chain/compare.py declared.sbom.cdx.json installed.sbom.cdx.json
+
+      - name: Write the disk from a compressed OCI layout
+        timeout-minutes: 30
+        run: |
+          sudo skopeo copy containers-storage:"$IMAGE" "oci:$OCI:test"
+          truncate -s 32G "$DISK"
+          sudo podman run --rm --privileged --pid=host \
+            --security-opt label=type:unconfined_t \
+            -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
+            -v "$OCI:/src-oci:ro" -v "$(dirname "$DISK"):/output" \
+            "$IMAGE" bootc install to-disk --via-loopback "/output/$(basename "$DISK")" \
+            --source-imgref oci:/src-oci:test \
+            --composefs-backend --bootloader systemd --wipe --filesystem ext4 --allow-missing-verity
+
+      - name: Boot check (the disk the gate publishes is one that boots)
+        timeout-minutes: 15
+        run: |
+          python3 tests/vm/bootcheck.py --disk "$DISK" \
+            --out "$WORK/bootcheck" --hash-disk --boot-timeout 420 --shutdown-timeout 120
+
+      - name: Push and sign the tested digest
+        if: ${{ inputs.publish }}
+        env:
+          QUAY_ROBOT_USERNAME: ${{ secrets.QUAY_ROBOT_USERNAME }}
+          QUAY_ROBOT_TOKEN: ${{ secrets.QUAY_ROBOT_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          # The digest that was scanned and booted is the one that is pushed: everything after
+          # this line is about that digest, and nothing rebuilds.
+          tested="$(sudo skopeo inspect --format '{{.Digest}}' "containers-storage:$IMAGE")"
+          printf '%s' "$QUAY_ROBOT_TOKEN" | sudo podman login quay.io --username "$QUAY_ROBOT_USERNAME" --password-stdin
+          sudo skopeo copy --preserve-digests "containers-storage:$IMAGE" "docker://$DEST:$GITHUB_SHA"
+          digest="$(sudo skopeo inspect --format '{{.Digest}}' "docker://$DEST:$GITHUB_SHA")"
+          [ "$digest" = "$tested" ] || { echo "::error::$DEST:$GITHUB_SHA is $digest, not the tested $tested"; exit 1; }
+          ref="$DEST@$digest"
+          printf '%s' "$QUAY_ROBOT_TOKEN" | cosign login quay.io --username "$QUAY_ROBOT_USERNAME" --password-stdin
+          cosign sign --yes "$ref"
+          cosign attest --yes --type "https://deskos.org/supply-chain/sbom/v1" \
+            --predicate installed.sbom.cdx.json "$ref"
+          cosign attest --yes --type "https://deskos.org/supply-chain/effective-exceptions/v1" \
+            --predicate "$WORK/effective-exceptions.json" "$ref"
+          # The identity carries this repository's name, which is why the verification is part
+          # of the same step: a signature nobody checked is a claim nobody made.
+          cosign verify "$ref" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp '^https://github\.com/deskosproject/deskos-ubuntu/' | tee cosign-verify.txt
+          cosign verify-attestation --type "https://deskos.org/supply-chain/sbom/v1" "$ref" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp '^https://github\.com/deskosproject/deskos-ubuntu/' > /dev/null
+          # The moving tags move only after the signature is verified, and only when the
+          # registry hands back the digest that was signed.
+          for tag in 26.04 latest; do
+            sudo skopeo copy --preserve-digests "oci:$OCI:test" "docker://$DEST:$tag"
+            moved="$(sudo skopeo inspect --format '{{.Digest}}' "docker://$DEST:$tag")"
+            [ "$moved" = "$digest" ] || { echo "::error::$DEST:$tag is $moved, not the signed $digest"; exit 1; }
+          done
+
+      - name: Evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-evidence
+          path: |
+            grype.txt
+            cves.json
+            declared.sbom.cdx.json
+            installed.sbom.cdx.json
+            cosign-verify.txt
+            ${{ env.WORK }}/effective-exceptions.json
+            ${{ env.WORK }}/gate.grype.yaml
+            ${{ env.WORK }}/bootcheck/summary.md
+            ${{ env.WORK }}/dpkg-l.txt
+          retention-days: 30
+          if-no-files-found: warn
