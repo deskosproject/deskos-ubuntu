@@ -14,15 +14,21 @@ spec:
   architectures: [x86_64]
   packageManager: deb
   bootc:
-    image: quay.io/deskos/deskos-ubuntu-base:26.04
+    # The base is built and maintained by the Project DeskOS, in
+    # deskosproject/deskos-ubuntu-bootc, because Canonical publishes no bootc base.
+    # The repository was renamed from `deskos-ubuntu-base` to `deskos-ubuntu-bootc`
+    # on 2026-10-18 and republished under the new name; the old repository keeps the
+    # digests it carried.
+    image: quay.io/deskos/deskos-ubuntu-bootc:26.04
     # The manifest digest of the base with no third-party apt source and no
     # inherited account. The account mattered: GDM starts GNOME Initial Setup only
     # when no user exists and asks AccountsService, which counted the uid-1000
     # `ubuntu` account the upstream container image ships — so the wizard never ran.
     # With it removed, `tests/vm/firstbootcheck.py` reports the wizard running.
-    # Confirmed against the registry on 2026-10-16: `:26.04` and `:latest` both
-    # resolve to this digest. It moves deliberately.
-    digest: sha256:ec5ce29551fdc9f311aef5c5fa82d147727416bce0fa757f5f272fd8c53303f2
+    # Confirmed against the registry on 2026-10-18, after the republish: `:26.04` and
+    # `:latest` both resolve to this digest, and `cosign verify` passes under that
+    # repository's own workflow identity. It moves deliberately.
+    digest: sha256:ab66fd826d940ae0a62442cf649479a5ccab1e34ee58db867e455b24e3f6d038
   distribution:
     # Ubuntu's archive is freely redistributable and needs no subscription. The
     # base, however, is maintained by the Project DeskOS and not by Canonical:
