@@ -2,8 +2,8 @@
   "owner": "rarguello",
   "review": "2026-11-17",
   "base": {
-    "image": "quay.io/deskos/deskos-ubuntu-base:26.04",
-    "digest": "sha256:ec5ce29551fdc9f311aef5c5fa82d147727416bce0fa757f5f272fd8c53303f2"
+    "image": "quay.io/deskos/deskos-ubuntu-bootc:26.04",
+    "digest": "sha256:ab66fd826d940ae0a62442cf649479a5ccab1e34ee58db867e455b24e3f6d038"
   },
   "exceptions": [
     {
