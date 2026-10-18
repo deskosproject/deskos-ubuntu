@@ -4,6 +4,10 @@
 dist/
 output/
 
+# The deskos-core checkout the workflows make, to read the supply-chain scripts it owns. It is
+# a checkout, not a submodule, and nothing of it belongs in this repository's history.
+.deskos-core/
+
 # Python bytecode from the vendored harness.
 __pycache__/
 *.pyc

@@ -73,7 +73,9 @@ jobs:
           tool=".deskos/$DESKOS_VERSION/deskosctl-$DESKOS_VERSION-linux-amd64"
           "$tool" validate .
           "$tool" render . --workstation "$WORKSTATION" --output ctx
-          "$tool" sbom --workstation "$WORKSTATION" --output declared.sbom.cdx.json
+          # The root is a positional argument, and a flavor must pass it: without one the
+          # tool reads only the Core it embeds, where this workstation does not exist.
+          "$tool" sbom . --workstation "$WORKSTATION" --output declared.sbom.cdx.json
           sha256sum ctx/plan.json ctx/generated-manifest.json declared.sbom.cdx.json
 
       - name: Put container storage and the large artifacts on /mnt
@@ -187,6 +189,23 @@ jobs:
           python3 tests/vm/bootcheck.py --disk "$DISK" \
             --out "$WORK/bootcheck" --hash-disk --boot-timeout 420 --shutdown-timeout 120
 
+      - name: Session check (instrumented boot)
+        id: session
+        timeout-minutes: 25
+        run: |
+          # Before the push, because the image the gate publishes should be the image that
+          # passed every check this repository makes, not the one that passed the cheapest:
+          # Core's own gate runs these two before it tags.
+          python3 tests/vm/sessioncheck.py --mode session --disk "$DISK" \
+            --plan ctx/plan.json --out "$WORK/session" --boot-timeout 900
+
+      - name: First-boot check (is the wizard the session, can an account log in)
+        id: firstboot
+        timeout-minutes: 25
+        run: |
+          python3 tests/vm/firstbootcheck.py --disk "$DISK" \
+            --out "$WORK/firstboot" --boot-timeout 900
+
       - name: Push and sign the tested digest
         if: ${{ inputs.publish }}
         env:
@@ -238,6 +257,8 @@ jobs:
             ${{ env.WORK }}/effective-exceptions.json
             ${{ env.WORK }}/gate.grype.yaml
             ${{ env.WORK }}/bootcheck/summary.md
+            ${{ env.WORK }}/session/session.md
+            ${{ env.WORK }}/firstboot/firstboot.md
             ${{ env.WORK }}/dpkg-l.txt
           retention-days: 30
           if-no-files-found: warn
