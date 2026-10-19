@@ -81,6 +81,13 @@ sudo podman run --rm --privileged --pid=host \
 point at this image, never at the base:** pointing it at the base would replace
 the workstation with the base at the next update.
 
+**If you need a qcow2 or an ISO** rather than a raw disk: `bootc-image-builder`
+aborts on hosts running kernel 7.0 — which is Ubuntu 26.04 itself — at
+`org.osbuild.container-deploy`, with `EACCES` on `/run/osbuild/containers/storage`
+([osbuild#2579](https://github.com/osbuild/osbuild/issues/2579), where it is
+measured). The base repository's README carries the detail and the workaround, and
+the reason `bootc install to-disk` is the supported path here.
+
 This path is validated in a virtual machine here, from a compressed OCI layout
 rather than from the registry, and never on real hardware
 ([What is worth testing](#what-is-worth-testing)).
