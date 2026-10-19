@@ -3,7 +3,14 @@
 **Ubuntu 26.04 LTS with GNOME, as a bootc image — installable, updatable and
 rollback-able like any other DeskOS workstation.**
 
+Verify what you are about to boot before you boot it — the signature names this
+repository. Do this first, not after:
+
 ```bash
+cosign verify quay.io/deskos/deskos-ubuntu:26.04 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/deskosproject/deskos-ubuntu/'
+
 sudo bootc switch quay.io/deskos/deskos-ubuntu:26.04
 sudo reboot
 ```
@@ -27,13 +34,13 @@ Ubuntu has none, so this organization owns one
 ## Use it
 
 The image is published at `quay.io/deskos/deskos-ubuntu`, tagged `26.04` and
-`:latest`, built and booted by this repository's gate before it was pushed. The
-workstations in it:
+`:latest`: it is the `deskos-ubuntu` workstation, built and booted by this
+repository's gate before it was pushed.
 
 | Workstation | What it is |
 |---|---|
-| `deskos-ubuntu` | DeskOS on Ubuntu, keeping Ubuntu's own GNOME layout and defaults |
-| `deskos-ubuntu-org-packages` | the same, plus the example organization's own packages |
+| `deskos-ubuntu` | **the published one**: DeskOS on Ubuntu, keeping Ubuntu's own GNOME layout and defaults |
+| `deskos-ubuntu-org-packages` | a second resource root — the same, plus the example organization's own packages — that you render and build yourself |
 
 On a machine that already runs bootc:
 
@@ -50,15 +57,6 @@ skopeo inspect --format '{{.Digest}}' docker://quay.io/deskos/deskos-ubuntu:26.0
 sudo bootc switch quay.io/deskos/deskos-ubuntu@sha256:<that digest>
 ```
 
-Verify what you are about to boot before you boot it — the signature names this
-repository:
-
-```bash
-cosign verify quay.io/deskos/deskos-ubuntu:26.04 \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github\.com/deskosproject/deskos-ubuntu/'
-```
-
 **It does not work from a stock Ubuntu install.** This is a new operating-system
 image, not a configuration layer on top of one.
 
@@ -68,19 +66,23 @@ A machine needs a bootc-capable source to install from, and Ubuntu has no
 Anaconda path. The disk is written directly, from the published image:
 
 ```bash
-# on a bootc host with the disk attached — this WIPES /dev/<your-disk>
-sudo bootc install to-disk \
-  --source-imgref docker://quay.io/deskos/deskos-ubuntu:26.04 \
+# WIPES /dev/<your-disk>. bootc install runs INSIDE the image being installed,
+# which is how this repository runs it, not from the host.
+sudo podman run --rm --privileged --pid=host \
+  --security-opt label=type:unconfined_t \
+  -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
+  quay.io/deskos/deskos-ubuntu:26.04 \
+  bootc install to-disk /dev/<your-disk> --wipe \
   --target-imgref quay.io/deskos/deskos-ubuntu:26.04 \
-  --wipe /dev/<your-disk>
+  --composefs-backend --bootloader systemd --filesystem ext4
 ```
 
-`--source-imgref` is where the install reads the image from; `--target-imgref` is
-where the installed machine looks for its updates. **They are different
-questions, and pointing the target at the base instead of at this image would
-replace the workstation with the base at the next update.**
+`--target-imgref` is where the installed machine looks for its updates. **It must
+point at this image, never at the base:** pointing it at the base would replace
+the workstation with the base at the next update.
 
-This path is validated in a virtual machine here, never on real hardware
+This path is validated in a virtual machine here, from a compressed OCI layout
+rather than from the registry, and never on real hardware
 ([What is worth testing](#what-is-worth-testing)).
 
 ## Make it yours
@@ -123,12 +125,16 @@ Everything below compiles the image yourself. It needs **git**, rootful Podman,
 and `deskosctl` from the Core release this repository pins in `deskos.env`:
 
 ```bash
-# 1. the compiler, at the pinned release — not "latest", which may be another one
+# 1. the compiler, at the pinned release — not "latest", which may be another one.
+# A pinned release names its asset with the version in it; only
+# releases/latest/download has the version-less name.
 . ./deskos.env
 base="https://github.com/deskosproject/deskos-core/releases/download/$DESKOS_VERSION"
-mkdir -p bin && curl -fL -O "$base/deskosctl-linux-amd64" -O "$base/SHA256SUMS"
+mkdir -p bin && cd bin
+curl -fL -O "$base/deskosctl-$DESKOS_VERSION-linux-amd64" -O "$base/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
-install -D -m 0755 deskosctl-linux-amd64 bin/deskosctl
+mv "deskosctl-$DESKOS_VERSION-linux-amd64" deskosctl && chmod 0755 deskosctl
+cd ..
 
 # 2. the resources, as this repository declares them
 ./bin/deskosctl validate .
@@ -145,9 +151,10 @@ sudo bootc install to-disk --target-imgref quay.io/<you>/deskos-ubuntu:test \
 ```
 
 `make validate` composes every workstation in this repository without building
-anything, and `make vm-test` runs the boot, session and first-boot checks against
-a disk. The disk step is the only install path this repository validates, and only
-ever in a virtual machine.
+anything, and `make vm-test` runs the test harness's own unit tests. The disk,
+boot, session and first-boot checks need a disk and a hypervisor, and they run in
+this repository's publish gate — which is why the image you pull has already been
+booted.
 
 ## What is worth testing
 
