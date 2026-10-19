@@ -244,8 +244,15 @@ jobs:
             --certificate-identity-regexp '^https://github\.com/deskosproject/deskos-ubuntu/' > /dev/null
           # The moving tags move only after the signature is verified, and only when the
           # registry hands back the digest that was signed.
+          # From the digest itself, inside the registry: no layer is copied and no
+          # encoding can change the manifest on the way. This used to retag from the
+          # OCI layout, and a layout copy re-encodes the manifest -- skopeo refuses to
+          # preserve digests from containers-storage to an oci layout ("this image
+          # would require changing layer representation") -- so the tag ended up on a
+          # manifest the step had never signed. The check below caught exactly that,
+          # which is why the tag is now written from the digest this step verified.
           for tag in 26.04 latest; do
-            sudo skopeo copy --preserve-digests "oci:$OCI:test" "docker://$DEST:$tag"
+            sudo skopeo copy --preserve-digests "docker://$DEST@$digest" "docker://$DEST:$tag"
             moved="$(sudo skopeo inspect --format '{{.Digest}}' "docker://$DEST:$tag")"
             [ "$moved" = "$digest" ] || { echo "::error::$DEST:$tag is $moved, not the signed $digest"; exit 1; }
           done
