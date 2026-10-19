@@ -1,0 +1,32 @@
+{
+  "format": "manifest.deskos.org/v1alpha1",
+  "backend": "containerfile",
+  "workstation": "deskos-ubuntu",
+  "files": [
+    {
+      "path": "Containerfile",
+      "mode": "0644",
+      "sha256": "fcc64a90f01092f34da001261af87d7bc63474b5b6c26d08026ba6ab69a80ac4"
+    },
+    {
+      "path": "plan.json",
+      "mode": "0644",
+      "sha256": "d9d86118a4b526eeb4d2f4e6d03463d9a7d30de2311735531d5428ba37b70550"
+    },
+    {
+      "path": "rootfs/usr/lib/systemd/system/deskos-image-update.service",
+      "mode": "0644",
+      "sha256": "f1396381e11eda12d9ebb33964b635ea75f0390d2dd6fd9c2fd7ba516c5bc9e7"
+    },
+    {
+      "path": "rootfs/usr/lib/systemd/system/deskos-image-update.timer",
+      "mode": "0644",
+      "sha256": "a400d9116d980e1fd1a999b1bbe7b5c89964646cbf271b93e447f247f3c48fdc"
+    },
+    {
+      "path": "rootfs/usr/share/deskos/plan.json",
+      "mode": "0644",
+      "sha256": "d9d86118a4b526eeb4d2f4e6d03463d9a7d30de2311735531d5428ba37b70550"
+    }
+  ]
+}
