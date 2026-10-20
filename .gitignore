@@ -16,3 +16,7 @@ __pycache__/
 *.qcow2
 *.raw
 *.iso
+
+# The rendered build context. `deskosctl render --output ctx` writes it, and it is
+# regenerated on every build: it must never be committed.
+ctx/
